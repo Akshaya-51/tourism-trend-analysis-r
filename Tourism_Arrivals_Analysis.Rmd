@@ -1,0 +1,524 @@
+---
+title: "Tourism Trend Analysis and Tourist Arrival Prediction Using R"
+author: "[Your name], [Roll number]"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5, fig.align = "center")
+
+# install any missing packages once
+pkgs <- c("dplyr", "tidyr", "ggplot2", "scales", "knitr", "WDI",
+          "countrycode", "mgcv", "randomForest")
+new_pkgs <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(new_pkgs) > 0) install.packages(new_pkgs)
+
+library(dplyr); library(tidyr); library(ggplot2); library(scales)
+library(WDI); library(countrycode); library(mgcv); library(randomForest)
+
+theme_set(theme_minimal(base_size = 13))
+teal <- "#2A8C82"; orange <- "#E8590C"; blue <- "#364FC7"
+```
+
+# 1. Introduction and Problem Statement
+
+Tourism supports economic development, employment and cultural exchange, and
+governments and businesses plan transport, hotels and marketing around the
+number of visitors they expect. Arrivals move with economic conditions, travel
+costs and global events such as the 2020 pandemic. This project analyses World
+Bank data on international tourist arrivals to answer practical questions: which
+countries receive the most visitors, how arrivals have grown, how strongly the
+pandemic reduced them, and whether future arrivals can be predicted from past
+arrivals.
+
+**Problem statement:** How can historical international tourist arrival data be
+analysed to identify tourism trends and predict future arrivals?
+
+# 2. Objectives
+
+1. Import and clean the raw data (missing values, duplicates, regional totals,
+   invalid values) and document every change.
+2. Identify the largest destinations and how concentrated tourism is.
+3. Measure growth and compare trends across selected countries.
+4. Quantify the effect of the 2020 pandemic (paired t-test).
+5. Measure the relationship between last year's and this year's arrivals
+   (Pearson correlation).
+6. Predict arrivals with linear regression, a generalized additive model (GAM)
+   and a random forest, and compare them using MAE, RMSE and R-squared.
+
+# 3. Dataset
+
+* **Source:** World Bank, World Development Indicators (WDI)
+* **Indicator:** International tourism, number of arrivals (`ST.INT.ARVL`)
+* **Access:** downloaded in R with the `WDI` package for all countries and
+  regions, 1960 to 2023, then saved as `tourism_arrivals_raw.csv`
+* **Dataset URL:** https://data.worldbank.org/indicator/ST.INT.ARVL
+* **Project repository:** *(paste your GitHub link here)*
+
+| Column | Description |
+|---|---|
+| country | Country or region name |
+| iso2c, iso3c | Two- and three-letter country codes |
+| year | Calendar year |
+| arrivals | Number of international tourist arrivals |
+
+```{r load}
+data_file <- "tourism_arrivals_raw.csv"
+
+if (file.exists(data_file)) {
+  # na.strings = "" keeps Namibia's country code "NA" as text, not missing
+  raw <- read.csv(data_file, na.strings = "", stringsAsFactors = FALSE)
+} else {
+  raw <- WDI(country = "all", indicator = c(arrivals = "ST.INT.ARVL"),
+             start = 1960, end = 2023)
+  write.csv(raw, data_file, row.names = FALSE, na = "")
+}
+
+cat("Rows:", nrow(raw), " Columns:", ncol(raw), "\n")
+head(raw)
+colSums(is.na(raw))
+```
+
+The original download has **`r format(nrow(raw), big.mark = ",")` rows and
+`r ncol(raw)` columns**. Many country-year combinations have no value, so a
+large share of the `arrivals` column is missing.
+
+# 4. Data Preparation
+
+```{r clean}
+n_raw     <- nrow(raw)
+n_missing <- sum(is.na(raw$arrivals))
+
+tour  <- distinct(raw)                               # duplicates
+n_dup <- n_raw - nrow(tour)
+
+tour <- tour %>% filter(!is.na(arrivals))            # missing arrivals
+
+# regional totals (World, regions, income groups) have no continent
+tour$cont <- suppressWarnings(countrycode(tour$iso2c, "iso2c", "continent"))
+n_agg_entities <- n_distinct(tour$country[is.na(tour$cont)])
+n_agg_rows     <- sum(is.na(tour$cont))
+tour <- tour %>% filter(!is.na(cont))
+
+n_invalid <- sum(tour$arrivals <= 0)                 # zero or negative values
+tour <- tour %>%
+  filter(arrivals > 0) %>%
+  transmute(country, year = as.integer(year), arrivals = as.numeric(arrivals)) %>%
+  arrange(country, year)
+
+n_countries <- n_distinct(tour$country)
+```
+
+**Result:** `r n_dup` duplicate rows were removed and `r format(n_missing, big.mark = ",")`
+rows with missing arrivals were dropped. `r n_agg_entities` regional totals and
+unmatched codes (such as World and income groups, `r n_agg_rows` rows) were
+removed so that only countries are compared, and `r n_invalid` rows had zero or
+negative arrivals. The clean dataset has **`r format(nrow(tour), big.mark = ",")`**
+rows for **`r n_countries`** countries, covering **`r min(tour$year)` to
+`r max(tour$year)`**. No values are available after `r max(tour$year)`.
+
+### Modelling data
+
+For modelling we use the log of arrivals and last year's log arrivals (a lag).
+The lag is only used when the previous year exists for that country. Years up to
+2019 are kept, because the 2020 pandemic is an exceptional shock that last
+year's arrivals cannot predict.
+
+```{r model-data}
+model_df <- tour %>%
+  filter(year <= 2019) %>%
+  group_by(country) %>%
+  mutate(log_arr  = log(arrivals),
+         log_lag1 = if_else(year - lag(year) == 1, lag(log_arr), NA_real_)) %>%
+  ungroup() %>%
+  filter(!is.na(log_lag1))
+
+dim(model_df)
+```
+
+# 5. Analysis
+
+## 5.1 Descriptive statistics (2019)
+
+```{r desc}
+d19 <- tour %>% filter(year == 2019) %>% mutate(m = arrivals / 1e6)
+
+desc <- data.frame(
+  Statistic = c("Countries with 2019 data", "Mean (millions)", "Median (millions)",
+                "Std. deviation (millions)", "Maximum (millions)"),
+  Value = round(c(nrow(d19), mean(d19$m), median(d19$m), sd(d19$m), max(d19$m)), 2))
+knitr::kable(desc)
+```
+
+The mean is much larger than the median, so a few countries receive very large
+numbers of visitors while most receive far fewer.
+
+## 5.2 Largest destinations
+
+```{r top10}
+top10 <- d19 %>%
+  slice_max(arrivals, n = 10) %>%
+  mutate(share = round(100 * arrivals / sum(d19$arrivals), 1))
+
+knitr::kable(top10 %>%
+  transmute(Country = country, `Arrivals (millions)` = round(m, 1),
+            `Share of all arrivals (%)` = share))
+
+top5       <- d19 %>% slice_max(arrivals, n = 5) %>% pull(country)
+top5_share <- round(100 * sum(d19$arrivals[d19$country %in% top5]) /
+                      sum(d19$arrivals), 1)
+```
+
+The five largest destinations (`r paste(top5, collapse = ", ")`) account for
+**`r top5_share`%** of all 2019 arrivals across the `r nrow(d19)` countries with data.
+
+## 5.3 Growth and trends
+
+We compare the five largest destinations plus India.
+
+```{r growth}
+selected <- union(top5, "India")
+sel <- tour %>% filter(country %in% selected) %>% mutate(arrivals_m = arrivals / 1e6)
+
+growth_tab <- sel %>%
+  filter(year <= 2019) %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  summarise(first_year = first(year), last_year = last(year),
+            first_m = round(first(arrivals) / 1e6, 2),
+            last_m  = round(last(arrivals) / 1e6, 2),
+            times   = round(last(arrivals) / first(arrivals), 2),
+            cagr_pct = round(((last(arrivals) / first(arrivals))^
+                                (1 / (last(year) - first(year))) - 1) * 100, 1)) %>%
+  arrange(desc(cagr_pct))
+knitr::kable(growth_tab,
+  col.names = c("Country", "First year", "Last year", "First (M)", "Last (M)",
+                "Times larger", "Growth per year (%)"))
+
+yoy_df <- sel %>%
+  group_by(country) %>% arrange(year) %>%
+  mutate(yoy = if_else(year - lag(year) == 1,
+                       (arrivals / lag(arrivals) - 1) * 100, NA_real_)) %>%
+  ungroup() %>% filter(!is.na(yoy))
+
+yoy_tab <- yoy_df %>%
+  filter(year != 2020) %>%
+  group_by(country) %>%
+  summarise(median_yoy = round(median(yoy), 1),
+            lowest = round(min(yoy), 1), highest = round(max(yoy), 1))
+knitr::kable(yoy_tab, col.names = c("Country", "Median yearly growth (%)",
+                                    "Lowest (%)", "Highest (%)"))
+```
+
+Growth is only calculated where the previous year is available. Extreme values,
+such as India in 2014 and the United States in 2006, look like changes in how
+arrivals are counted and not real growth.
+
+## 5.4 Effect of the pandemic
+
+```{r pandemic}
+pan_all <- tour %>%
+  filter(year %in% c(2019, 2020)) %>%
+  select(country, year, arrivals) %>%
+  pivot_wider(names_from = year, values_from = arrivals, names_prefix = "y") %>%
+  filter(!is.na(y2019), !is.na(y2020)) %>%
+  mutate(change_pct = (y2020 / y2019 - 1) * 100)
+
+n_pan   <- nrow(pan_all)
+med_fall <- round(median(pan_all$change_pct), 1)
+
+pan_sel <- sel %>%
+  filter(year %in% c(2019, 2020)) %>%
+  select(country, year, arrivals) %>%
+  pivot_wider(names_from = year, values_from = arrivals, names_prefix = "y") %>%
+  mutate(change_pct = round((y2020 / y2019 - 1) * 100, 1))
+knitr::kable(pan_sel, col.names = c("Country", "2019", "2020", "Change (%)"))
+```
+
+Across the `r n_pan` countries with both years, the median change from 2019 to
+2020 was **`r med_fall`%**. A missing 2020 value (NA in the table) means the
+World Bank has not reported it.
+
+## 5.5 Correlation analysis
+
+```{r corr}
+cor_lag <- cor(model_df$log_lag1, model_df$log_arr)
+cor.test(model_df$log_lag1, model_df$log_arr)
+```
+
+The Pearson correlation between last year's and this year's log arrivals is
+**r = `r round(cor_lag, 3)`**, a very strong positive relationship. A country's
+arrivals one year are very close to its arrivals the year before.
+
+## 5.6 Hypothesis test: 2019 vs 2020
+
+H0: the mean log arrivals in 2020 equals the mean log arrivals in 2019 (paired
+by country). H1: they differ.
+
+```{r ttest}
+t_pan <- t.test(log(pan_all$y2020), log(pan_all$y2019), paired = TRUE)
+t_pan
+avg_change <- round((exp(unname(t_pan$estimate)) - 1) * 100, 1)
+```
+
+The paired t-test gives p = `r signif(t_pan$p.value, 3)`. The average country
+lost about **`r abs(avg_change)`%** of its arrivals, so we reject H0: arrivals in
+2020 were significantly lower than in 2019.
+
+## 5.7 Prediction models
+
+We predict a country's log arrivals from last year's log arrivals and the year
+with three models from the course:
+
+* **Linear regression:** a simple, interpretable baseline.
+* **GAM (generalized additive model):** learns smooth, non-linear patterns.
+* **Random forest (bagging of many trees):** captures complex relationships, but
+  cannot predict beyond the range of values it was trained on.
+
+The data is split by time, not at random: training uses 1995 to 2014 and testing
+uses 2015 to 2019. Country is not used as a predictor because `randomForest`
+cannot handle a factor with more than 53 levels.
+
+```{r models}
+train <- model_df %>% filter(year <= 2014)
+test  <- model_df %>% filter(year >= 2015)
+cat("Train rows:", nrow(train), "| Test rows:", nrow(test), "\n")
+
+set.seed(123)
+m_lm  <- lm(log_arr ~ log_lag1 + year, data = train)
+m_gam <- gam(log_arr ~ s(log_lag1) + s(year), data = train)
+m_rf  <- randomForest(log_arr ~ log_lag1 + year, data = train, ntree = 500)
+
+knitr::kable(round(summary(m_lm)$coefficients, 4), caption = "Linear regression")
+knitr::kable(round(summary(m_gam)$s.table, 3), caption = "GAM smooth terms")
+knitr::kable(round(importance(m_rf), 1), caption = "Random forest importance")
+```
+
+```{r predict}
+results <- test %>%
+  mutate(pred_lm   = exp(predict(m_lm,  newdata = test)),
+         pred_gam  = exp(as.numeric(predict(m_gam, newdata = test))),
+         pred_rf   = exp(predict(m_rf,  newdata = test)),
+         pred_last = exp(log_lag1))       # benchmark: repeat last year's value
+
+metrics <- function(actual, pred) {
+  data.frame(MAE  = mean(abs(actual - pred)),
+             RMSE = sqrt(mean((actual - pred)^2)),
+             R2   = 1 - sum((actual - pred)^2) / sum((actual - mean(actual))^2))
+}
+
+a <- results$arrivals / 1e6
+metrics_tbl <- rbind(
+  cbind(Model = "Linear regression", metrics(a, results$pred_lm  / 1e6)),
+  cbind(Model = "GAM",               metrics(a, results$pred_gam / 1e6)),
+  cbind(Model = "Random forest",     metrics(a, results$pred_rf  / 1e6)),
+  cbind(Model = "Repeat last year",  metrics(a, results$pred_last / 1e6)))
+
+knitr::kable(metrics_tbl, digits = 3,
+             caption = "Test-set metrics, 2015 to 2019 (MAE and RMSE in millions)")
+
+three      <- metrics_tbl %>% filter(Model != "Repeat last year")
+best_model <- three$Model[which.min(three$RMSE)]
+best_row   <- metrics_tbl %>% filter(Model == best_model)
+base_row   <- metrics_tbl %>% filter(Model == "Repeat last year")
+beats_base <- best_row$RMSE < base_row$RMSE
+```
+
+**Result:** **`r best_model`** had the lowest RMSE (`r round(best_row$RMSE, 2)`
+million), with MAE `r round(best_row$MAE, 2)` million and R-squared
+`r round(best_row$R2, 3)`. In the linear model, last year's log arrivals has a
+coefficient of `r round(coef(m_lm)["log_lag1"], 3)` and the year term has
+p = `r round(summary(m_lm)$coefficients["year", "Pr(>|t|)"], 3)`, so the year adds
+little once last year's arrivals is known. The simple benchmark of repeating last
+year's value has an RMSE of `r round(base_row$RMSE, 2)` million, so the best model
+**`r ifelse(beats_base, "improves on", "does not improve on")`** it.
+
+# 6. Visualization
+
+```{r fig-top10}
+ggplot(top10, aes(reorder(country, m), m)) +
+  geom_col(fill = teal) + coord_flip() +
+  geom_text(aes(label = round(m, 1)), hjust = -0.2) +
+  labs(title = "Top 10 Countries by Tourist Arrivals, 2019",
+       x = NULL, y = "Arrivals (millions)") +
+  expand_limits(y = max(top10$m) * 1.12)
+```
+
+A handful of countries receive far more visitors than the rest, so tourism is highly concentrated.
+
+```{r fig-trend}
+ggplot(sel, aes(year, arrivals_m, colour = country)) +
+  geom_line(linewidth = 1) + geom_point(size = 1.5) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(title = "International Tourist Arrivals, Selected Countries",
+       x = "Year", y = "Arrivals (millions)", colour = "Country")
+```
+
+Most countries grow until 2019 and then fall sharply in 2020. The points show where
+data exists, so gaps (for example France, 1998 to 2003) are visible. The jump for
+the United States in 2006 looks like a counting change.
+
+```{r fig-log}
+ggplot(sel, aes(year, arrivals_m, colour = country)) +
+  geom_line(linewidth = 1) + geom_point(size = 1.5) +
+  scale_y_log10() + scale_colour_brewer(palette = "Dark2") +
+  labs(title = "International Tourist Arrivals (log scale)",
+       subtitle = "Equal slopes mean equal percentage growth",
+       x = "Year", y = "Arrivals (millions, log scale)", colour = "Country")
+```
+
+On a log scale, small and large countries can be compared fairly. India rises
+steeply, including a step around 2014, although its absolute arrivals stay small.
+
+```{r fig-growth}
+ggplot(yoy_df, aes(year, yoy)) +
+  geom_col(fill = teal) +
+  facet_wrap(~ country, scales = "free_y") +
+  labs(title = "Year-on-Year Growth in Arrivals",
+       subtitle = "Each panel has its own vertical scale",
+       x = "Year", y = "Growth (%)")
+```
+
+In normal years growth is small, a few percent. Spikes for India (2014) and the
+United States (2006) look like data breaks, and every country falls sharply in 2020.
+
+```{r fig-index}
+sel %>%
+  group_by(country) %>%
+  filter(any(year == 1995)) %>%
+  mutate(index = arrivals / arrivals[year == 1995] * 100) %>%
+  ungroup() %>%
+  ggplot(aes(year, index, colour = country)) +
+  geom_line(linewidth = 1) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(title = "Arrivals Indexed to 1995 = 100",
+       x = "Year", y = "Index (1995 = 100)", colour = "Country")
+```
+
+Indexing compares each country with its own 1995 level. India reaches about eight
+times its 1995 level, helped by the 2014 jump. France is missing because it has no
+value for 1995.
+
+```{r fig-pandemic}
+sel %>%
+  filter(year %in% c(2019, 2020)) %>%
+  ggplot(aes(country, arrivals_m, fill = factor(year))) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("2019" = blue, "2020" = orange)) +
+  labs(title = "Arrivals Before and During the Pandemic",
+       x = NULL, y = "Arrivals (millions)", fill = "Year") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggplot(pan_all, aes(change_pct)) +
+  geom_histogram(binwidth = 5, fill = orange, colour = "white") +
+  geom_vline(xintercept = median(pan_all$change_pct), colour = "red",
+             linetype = "dashed") +
+  labs(title = "Change in Arrivals from 2019 to 2020, All Countries",
+       subtitle = "Red dashed line = median",
+       x = "Change (%)", y = "Number of countries")
+```
+
+Almost every country lost visitors in 2020. India has no 2020 value in the data, so
+it has no bar.
+
+```{r fig-corr}
+ggplot(model_df, aes(log_lag1, log_arr)) +
+  geom_point(alpha = 0.25, colour = blue) +
+  geom_smooth(method = "lm", colour = "red", formula = y ~ x) +
+  labs(title = "Last Year's vs This Year's Arrivals (log scale)",
+       subtitle = paste("Pearson r =", round(cor_lag, 3)),
+       x = "Log arrivals, previous year", y = "Log arrivals, current year")
+```
+
+The points lie almost on a straight line, so arrivals in one year are very close to
+arrivals the year before.
+
+```{r fig-pred}
+results %>%
+  select(arrivals, `Linear regression` = pred_lm, GAM = pred_gam,
+         `Random forest` = pred_rf) %>%
+  pivot_longer(-arrivals, names_to = "Model", values_to = "predicted") %>%
+  ggplot(aes(arrivals / 1e6, predicted / 1e6)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, colour = "red") +
+  scale_x_log10() + scale_y_log10() +
+  facet_wrap(~ Model) +
+  labs(title = "Actual vs Predicted Arrivals, 2015-2019",
+       x = "Actual (millions, log scale)", y = "Predicted (millions, log scale)")
+
+ggplot(metrics_tbl, aes(reorder(Model, -RMSE), RMSE)) +
+  geom_col(fill = teal) + coord_flip() +
+  geom_text(aes(label = round(RMSE, 2)), hjust = -0.2) +
+  labs(title = "Test RMSE by Model (lower is better)",
+       x = NULL, y = "RMSE (millions of tourists)") +
+  expand_limits(y = max(metrics_tbl$RMSE) * 1.12)
+```
+
+Points near the red line are accurate predictions. The random forest flattens at the
+largest values and overpredicts the smallest countries, because tree models cannot
+predict outside the range they were trained on.
+
+# 7. Results
+
+| Question | Result |
+|---|---|
+| Largest destination, 2019 | `r top10$country[1]`: `r round(top10$m[1], 1)` million arrivals |
+| Concentration | Top 5 countries = `r top5_share`% of arrivals across `r nrow(d19)` countries |
+| Fastest growth per year, 1995 to 2019 (selected) | `r growth_tab$country[1]`: `r growth_tab$cagr_pct[1]`% a year (affected by data breaks) |
+| Typical yearly growth in normal years | Median `r round(median(yoy_tab$median_yoy), 1)`% across the selected countries |
+| Pandemic effect, 2019 to 2020 | Median change `r med_fall`% across `r n_pan` countries |
+| Paired t-test, 2019 vs 2020 | Average fall about `r abs(avg_change)`%, p = `r signif(t_pan$p.value, 3)` |
+| Last year's vs this year's arrivals | Pearson r = `r round(cor_lag, 3)` |
+| Best prediction model | `r best_model`: RMSE `r round(best_row$RMSE, 2)` million, R-squared `r round(best_row$R2, 3)` |
+| Beats "repeat last year"? | `r ifelse(beats_base, "Yes", "No")` (benchmark RMSE `r round(base_row$RMSE, 2)` million) |
+
+# 8. Conclusion
+
+Tourism is highly concentrated: `r paste(top5, collapse = ", ")` receive
+`r top5_share`% of all arrivals, while India's arrivals are small in absolute
+terms. Most selected countries grew steadily until 2019, with yearly growth usually
+a few percent. India grew fastest relative to its own 1995 level, but part of this
+comes from a jump around 2014 that looks like a change in counting, and the United
+States shows a similar jump in 2006. The 2020 pandemic caused a large and
+statistically significant fall in arrivals, with a median change of
+`r med_fall`% across `r n_pan` countries.
+
+Last year's arrivals explains almost everything in the models (r = `r round(cor_lag, 3)`),
+so tourist arrivals in one year are roughly last year's arrivals multiplied by a
+growth factor. **`r best_model`** gave the most accurate predictions on the test
+years, and the random forest was weakest because it cannot predict values beyond the
+range seen in training. A more complex model was not necessarily better here.
+
+Recommended actions: use last year's arrivals as the starting point for short-term
+demand planning; keep a margin for shocks like the pandemic, which no model based on
+past arrivals can foresee; and check how arrivals are counted before comparing
+countries or drawing conclusions from sudden jumps.
+
+**Limitations:** the models predict one year ahead using the actual previous year,
+which is easier than forecasting several years ahead; some series have missing years
+and breaks, and countries may count arrivals differently; R-squared is dominated by
+the largest countries; the data is annual, so seasonality cannot be studied; the
+pandemic years are excluded from the models; and the data ends in
+`r max(tour$year)`.
+
+**Future scope:** add predictors such as GDP, exchange rates and tourism receipts,
+model the pandemic and recovery separately, forecast several years ahead, add monthly
+data, and build an interactive dashboard.
+
+# 9. References
+
+* R Core Team (2024). *R: A Language and Environment for Statistical Computing*. https://www.R-project.org/
+* World Bank. *World Development Indicators: International tourism, number of arrivals (ST.INT.ARVL)*. https://data.worldbank.org/indicator/ST.INT.ARVL
+* Wickham, H. et al. *dplyr: A Grammar of Data Manipulation*. https://dplyr.tidyverse.org/
+* Wickham, H. (2016). *ggplot2: Elegant Graphics for Data Analysis*. Springer-Verlag, New York.
+* Arel-Bundock, V. *WDI: World Development Indicators and Other World Bank Data*. R package.
+* Arel-Bundock, V. et al. *countrycode: Convert Country Names and Country Codes*. R package.
+* Wood, S. *mgcv: Mixed GAM Computation Vehicle with Automatic Smoothness Estimation*. R package.
+* Liaw, A. and Wiener, M. (2002). Classification and Regression by randomForest. *R News*, 2(3), 18-22.
