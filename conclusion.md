@@ -3,9 +3,9 @@
 **Case study:** Tourism Trend Analysis and Tourist Arrival Prediction Using R
 **Course:** Introduction to Data Science using R
 
-## 1. What we did
+## 1. What I did
 
-We analysed World Bank data on international tourist arrivals (indicator
+I analysed World Bank data on international tourist arrivals (indicator
 `ST.INT.ARVL`, World Development Indicators), downloaded in R with the `WDI`
 package for all countries and regions from 1960 to 2023.
 
@@ -16,7 +16,7 @@ package for all countries and regions from 1960 to 2023.
 - After removing those totals so that only countries were compared, **4,683 rows for
   203 countries** remained, covering **1995 to 2020**. The data has no values after
   2020.
-- We explored the trends of the five largest destinations in 2019 (France, the
+- I explored the trends of the five largest destinations in 2019 (France, the
   United States, China, Spain and Mexico) and India, then built three models from the
   course: linear regression, a generalized additive model (GAM) and a random forest.
 - The models predict a country's log arrivals from last year's log arrivals and the
@@ -73,7 +73,7 @@ package for all countries and regions from 1960 to 2023.
 MAE and RMSE are in millions of tourists. **Linear regression scored best on all
 three measures**, followed by the GAM, with the random forest weakest.
 
-## 4. What we observed
+## 4. What I observed
 
 - **Tourism is highly concentrated.** A few countries receive far more visitors than
   the rest, and India's arrivals are small in absolute terms even though they grew
