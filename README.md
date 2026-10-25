@@ -3,7 +3,7 @@
 Case study for **Introduction to Data Science using R**
 (Artificial Intelligence and Data Science, CBIT, 2026-2027).
 
-**Author:** [Your name], [Roll number]
+**Author:** Akshaya
 
 ## Problem
 
